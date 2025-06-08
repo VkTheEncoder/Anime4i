@@ -9,82 +9,96 @@ import re
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
-# ── Load environment variables ─────────────────────────────────────────────────
+# ── Load env vars ───────────────────────────────────────────────────────────────
 load_dotenv()
 API_ID    = int(os.getenv("API_ID"))
 API_HASH  = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ── Base headers (User-Agent + optional cookies) ────────────────────────────────
+# ── Base headers for all requests ───────────────────────────────────────────────
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0")
 COOKIES    = os.getenv("COOKIES", "")
 BASE_HEADERS = {"User-Agent": USER_AGENT}
 if COOKIES:
     BASE_HEADERS["Cookie"] = COOKIES
 
-# ── Initialize Telegram client ───────────────────────────────────────────────────
+# ── Initialize Telegram bot client ──────────────────────────────────────────────
 client = TelegramClient("hls_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# ── Extract .m3u8 from an embed HTML page ─────────────────────────────────────────
-def extract_m3u8_from_embed(embed_url: str, headers: dict) -> str:
-    req = urllib.request.Request(embed_url, headers=headers)
-    html = urllib.request.urlopen(req).read().decode('utf-8')
-    # Match any http(s) URL ending with .m3u8
+# ── Extract the .m3u8 playlist URL from an embed HTML page ────────────────────────
+def extract_m3u8_from_embed(embed_url: str) -> str:
+    req = urllib.request.Request(embed_url, headers=BASE_HEADERS)
+    html = urllib.request.urlopen(req).read().decode('utf-8', errors='ignore')
+    # Find any http(s) link ending in .m3u8
     match = re.search(r'(https?://[^\s\'\"]+\.m3u8[^\s\'\"]*)', html)
     if not match:
         raise ValueError("No .m3u8 URL found in embed page HTML.")
     return match.group(1)
 
-# ── Synchronous HLS download + merge ─────────────────────────────────────────────
-def download_hls_sync(m3u8_url: str, output_path: str, headers: dict):
+# ── Download and merge segments synchronously ───────────────────────────────────
+def download_hls_sync(m3u8_url: str, output_ts: str, headers: dict):
+    # Fetch playlist
     req = urllib.request.Request(m3u8_url, headers=headers)
-    playlist = urllib.request.urlopen(req).read().decode().splitlines()
+    data = urllib.request.urlopen(req).read().decode().splitlines()
+
     base = m3u8_url.rsplit('/', 1)[0] + '/'
     segments = [
         line if line.startswith('http') else urljoin(base, line)
-        for line in playlist if line and not line.startswith('#')
+        for line in data if line and not line.startswith('#')
     ]
-    with open(output_path, 'wb') as wf:
+
+    with open(output_ts, 'wb') as out:
         for i, seg_url in enumerate(segments, 1):
-            print(f"[{i}/{len(segments)}] Downloading: {seg_url}")
+            print(f"[{i}/{len(segments)}] Downloading {seg_url}")
             seg_req = urllib.request.Request(seg_url, headers=headers)
-            wf.write(urllib.request.urlopen(seg_req).read())
+            out.write(urllib.request.urlopen(seg_req).read())
 
-# ── Async wrapper ───────────────────────────────────────────────────────────────
-async def download_hls(m3u8_url: str, output_path: str, headers: dict):
+# ── Async wrapper for non-blocking I/O ────────────────────────────────────────────
+async def download_hls(m3u8_url: str, output_ts: str, headers: dict):
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, download_hls_sync, m3u8_url, output_path, headers)
+    await loop.run_in_executor(None, download_hls_sync, m3u8_url, output_ts, headers)
 
-# ── Telegram message handler ─────────────────────────────────────────────────────
+# ── Handle incoming Telegram messages ─────────────────────────────────────────────
 @client.on(events.NewMessage)
 async def on_message(event):
     text = event.raw_text.strip()
+
+    # Prepare headers for download
     headers = copy.deepcopy(BASE_HEADERS)
-    # Determine message type
-    if ".m3u8" in text:
-        m3u8_url = text
-    elif "/embed/" in text:
-        headers["Referer"] = text
+
+    # Determine if this is an embed link or direct playlist
+    if '/embed/' in text:
+        embed_url = text
+        # Extract playlist URL first (use BASE_HEADERS)
         await event.reply("🔍 Extracting playlist URL from embed page…")
         try:
-            m3u8_url = extract_m3u8_from_embed(text, headers)
+            m3u8_url = extract_m3u8_from_embed(embed_url)
         except Exception as e:
-            return await event.reply(f"❌ Failed to extract playlist URL: {e}")
+            return await event.reply(f"❌ Failed to extract playlist: {e}")
+        # Use the embed page as Referer for subsequent requests
+        headers['Referer'] = embed_url
+    elif text.endswith('.m3u8') or '.m3u8?' in text:
+        m3u8_url = text
+        # Optionally, set Referer to the domain if needed
+        # headers['Referer'] = 'https://anime1u.com/'
     else:
-        return  # ignore other messages
+        # Not a link we handle
+        return
 
     status = await event.reply("⏳ Downloading and merging… please wait.")
     tmpdir = tempfile.mkdtemp()
-    output_ts = os.path.join(tmpdir, 'output.ts')
+    out_ts = os.path.join(tmpdir, 'output.ts')
+
     try:
-        await download_hls(m3u8_url, output_ts, headers)
+        await download_hls(m3u8_url, out_ts, headers)
     except Exception as e:
         return await status.edit(f"❌ Download failed: {e}")
 
+    # Send the combined TS file back
     await client.send_file(
         event.chat_id,
-        output_ts,
-        caption="✅ Here's your merged stream!",
+        out_ts,
+        caption="✅ Here’s your merged stream!",
         force_document=True,
         allow_cache=False,
     )
@@ -92,5 +106,5 @@ async def on_message(event):
 
 # ── Run the bot ─────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    print("🚀 Bot started – listening for links…")
+    print("🚀 Bot started – listening for embed or .m3u8 URLs…")
     client.run_until_disconnected()
